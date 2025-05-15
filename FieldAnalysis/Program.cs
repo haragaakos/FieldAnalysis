@@ -1,18 +1,43 @@
-﻿using Npgsql;
-
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Npgsql;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Threading;
 
 namespace FieldAnalysis
 {
     public class Program
     {
-        public static void Main(string[] args)
+        public static async Task Main(string[] args)
         {
-            string connectionString = "Host=db-gis-rosys.postgres.database.azure.com;Port=5432;Username=dbuser;Password=dbuser;Database=gis_test"; //adatbázis kapcsolat
+            string connectionString = "Host=db-gis-rosys.postgres.database.azure.com;Port=5432;Username=dbuser;Password=dbuser;Database=gis_test";
+            try
+            {
+                // 1. Adatok kinyerése
+                int[,] grid = FetchData(connectionString);
+                SaveRasterImage(grid, "raster.png");
 
-            int[,] grid = FetchData(connectionString); //1. Lépés: Adatok kinyerése
+                // 2. Klaszterezés
+                var (labels, centroids) = ClassifyCells(grid);
+                SaveClusterImage(labels, "clusters.png");
 
-            var clusters = ClassifyCells(grid); //2. Lépés: Cellák osztályozása (k-means klaszterezés)
+                // Klaszterek eloszlásának kiírása
+                int[] clusterCounts = new int[3];
+                for (int i = 0; i < 512; i++)
+                    for (int j = 0; j < 512; j++)
+                        clusterCounts[labels[i, j]]++;
+                Console.WriteLine($"Klaszterek eloszlása: {string.Join(", ", clusterCounts)}");
+                Console.WriteLine($"Centroidok: {string.Join(", ", centroids.Select(c => c.ToString("F2")))}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Hiba: {ex.Message}");
+            }
         }
+
         public static int[,] FetchData(string connectionString)
         {
             int[,] grid = new int[512, 512];
@@ -31,16 +56,25 @@ namespace FieldAnalysis
                     throw new Exception($"Érvénytelen raszter méret: {values.GetLength(0)}x{values.GetLength(1)}");
 
                 double min = double.MaxValue, max = double.MinValue;
+                bool hasNonInteger = false;
                 for (int i = 0; i < 512; i++)
                 {
                     for (int j = 0; j < 512; j++)
                     {
+                        if (values[i, j] != Math.Floor(values[i, j]))
+                        {
+                            hasNonInteger = true;
+                            Console.WriteLine($"Tört szám: [{i},{j}] = {values[i, j]}");
+                            break;
+                        }
                         grid[i, j] = (int)values[i, j];
                         min = Math.Min(min, values[i, j]);
                         max = Math.Max(max, values[i, j]);
                     }
+                    if (hasNonInteger) break;
                 }
                 Console.WriteLine($"Raszter érték minimum: {min}, maximum: {max}");
+                Console.WriteLine($"Tört számok: {hasNonInteger}");
             }
             catch (NpgsqlException ex)
             {
@@ -48,87 +82,133 @@ namespace FieldAnalysis
             }
             catch (InvalidCastException ex)
             {
-                throw new Exception("Típus konverzió hiba: " + ex.Message);
+                throw new Exception("Típuskonverzió hiba: " + ex.Message);
             }
             return grid;
         }
+
         public static (int[,], double[]) ClassifyCells(int[,] grid)
         {
             int width = grid.GetLength(0);
             int height = grid.GetLength(1);
             int[,] labels = new int[width, height];
-            double[] centroids = new double[3];
-            Random random = new Random();
-
-            //centroidok inicializálása véletlenszerűen
-            centroids[0] = grid[random.Next(width), random.Next(height)];
-            centroids[1] = grid[random.Next(width), random.Next(height)];
-            centroids[2] = grid[random.Next(width), random.Next(height)];
-
-
+            double[] centroids = InitializeCentroids(grid, 3);
             bool changed;
 
             do
             {
                 changed = false;
-                double[] oldCentroids = (double[])centroids.Clone();
-
-                //párhuzamos osztályozás
+                int[,] newLabels = new int[width, height];
                 Parallel.For(0, width, i =>
-               {
-                   for (int j = 0; j < width; j++)
-                   {
-                       int minimumIndex = 0;
-                       double minimumDistance = Math.Abs(grid[i, j] - centroids[0]);
-                       for (int k = 1; k < 3; k++)
-                       {
-                           double distance = Math.Abs(grid[i, j] - centroids[k]);
-                           if (distance < minimumDistance)
-                           {
-                               minimumDistance = distance;
-                               minimumIndex = k;
-                           }
-                       }
-                       lock (labels)
-                       {
-                           if (labels[i, j] != minimumIndex)
-                           {
-                               labels[i, j] = minimumIndex;
-                               changed = true; //ha megváltozott a címke, akkor true
-                           }
-                       }
-                   }
-               });
-                //centroidok frissítése
+                {
+                    for (int j = 0; j < height; j++)
+                    {
+                        int minimumIndex = 0;
+                        double minimumDistance = Math.Abs(grid[i, j] - centroids[0]);
+                        for (int k = 1; k < 3; k++)
+                        {
+                            double distance = Math.Abs(grid[i, j] - centroids[k]);
+                            if (distance < minimumDistance)
+                            {
+                                minimumDistance = distance;
+                                minimumIndex = k;
+                            }
+                        }
+                        newLabels[i, j] = minimumIndex;
+                    }
+                });
+
+                for (int i = 0; i < width; i++)
+                    for (int j = 0; j < height; j++)
+                        if (labels[i, j] != newLabels[i, j])
+                        {
+                            labels[i, j] = newLabels[i, j];
+                            changed = true;
+                        }
+
                 double[] sums = new double[3];
                 int[] counts = new int[3];
                 for (int i = 0; i < width; i++)
-                {
                     for (int j = 0; j < height; j++)
                     {
                         int label = labels[i, j];
                         sums[label] += grid[i, j];
                         counts[label]++;
                     }
-                }
+
+                Random random = new Random();
                 for (int k = 0; k < 3; k++)
                 {
                     if (counts[k] > 0)
-                    {
                         centroids[k] = sums[k] / counts[k];
-                    }
+                    else
+                        centroids[k] = grid[random.Next(width), random.Next(height)];
                 }
-                //korai leállítás
-                bool significantChange = false;
-                for (int k = 0; k < 3; k++)
-                    if (Math.Abs(centroids[k] - oldCentroids[k]) > 0.01)
-                        significantChange = true;
-                if (!significantChange)
-                    break;
-
             } while (changed);
 
-         return (labels, centroids);
+            return (labels, centroids);
+        }
+
+        private static double[] InitializeCentroids(int[,] grid, int k)
+        {
+            int width = grid.GetLength(0), height = grid.GetLength(1);
+            double[] centroids = new double[k];
+            Random random = new Random();
+            centroids[0] = grid[random.Next(width), random.Next(height)];
+            for (int i = 1; i < k; i++)
+            {
+                double[] distances = new double[width * height];
+                int index = 0;
+                double maxDist = 0;
+                for (int x = 0; x < width; x++)
+                {
+                    for (int y = 0; y < height; y++)
+                    {
+                        double minDist = double.MaxValue;
+                        for (int j = 0; j < i; j++)
+                            minDist = Math.Min(minDist, Math.Abs(grid[x, y] - centroids[j]));
+                        distances[index++] = minDist * minDist;
+                        maxDist = Math.Max(maxDist, distances[index - 1]);
+                    }
+                }
+                double threshold = random.NextDouble() * maxDist;
+                index = 0;
+                for (int x = 0; x < width; x++)
+                {
+                    for (int y = 0; y < height; y++)
+                    {
+                        if (distances[index] >= threshold)
+                        {
+                            centroids[i] = grid[x, y];
+                            break;
+                        }
+                        index++;
+                    }
+                    if (centroids[i] != 0) break;
+                }
+            }
+            return centroids;
+        }
+
+        public static void SaveRasterImage(int[,] grid, string filename)
+        {
+            Bitmap bmp = new Bitmap(512, 512);
+            for (int i = 0; i < 512; i++)
+                for (int j = 0; j < 512; j++)
+                    bmp.SetPixel(i, j, Color.FromArgb(grid[i, j], grid[i, j], grid[i, j]));
+            bmp.Save(filename, ImageFormat.Png);
+            Console.WriteLine($"Raszter kép mentve: {filename}");
+        }
+
+        public static void SaveClusterImage(int[,] labels, string filename)
+        {
+            Bitmap bmp = new Bitmap(512, 512);
+            Color[] colors = { Color.Red, Color.Green, Color.Blue };
+            for (int i = 0; i < 512; i++)
+                for (int j = 0; j < 512; j++)
+                    bmp.SetPixel(i, j, colors[labels[i, j]]);
+            bmp.Save(filename, ImageFormat.Png);
+            Console.WriteLine($"Klaszter kép mentve: {filename}");
         }
     }
 }
