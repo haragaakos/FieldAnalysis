@@ -1,11 +1,9 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
-using Npgsql;
+﻿using Npgsql;
 using System.Drawing;
 using System.Drawing.Imaging;
-using System.Threading;
+using NetTopologySuite.Features;
+using NetTopologySuite.Geometries;
+using NetTopologySuite.IO;
 
 namespace FieldAnalysis
 {
@@ -31,13 +29,23 @@ namespace FieldAnalysis
                         clusterCounts[labels[i, j]]++;
                 Console.WriteLine($"Klaszterek eloszlása: {string.Join(", ", clusterCounts)}");
                 Console.WriteLine($"Centroidok: {string.Join(", ", centroids.Select(c => c.ToString("F2")))}");
+
+                // 3. Polygon generálás
+                var polygons = GeneratePolygons(labels);
+                Console.WriteLine($"Generált régiók száma: {polygons.Count}");
+
+                // 4. GeoJSON kimenet generálása
+                var features = await CreateMultiPolygons(polygons, centroids, connectionString);
+                SaveGeoJson(features, "output.geojson");
+
+                Console.WriteLine("Feldolgozás sikeresen befejezve!");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Hiba: {ex.Message}");
             }
         }
-
+        //Adatok kinyerése PostgreSQL adatbázisból
         public static int[,] FetchData(string connectionString)
         {
             int[,] grid = new int[512, 512];
@@ -86,7 +94,7 @@ namespace FieldAnalysis
             }
             return grid;
         }
-
+        //Klaszterezés
         public static (int[,], double[]) ClassifyCells(int[,] grid)
         {
             int width = grid.GetLength(0);
@@ -148,7 +156,7 @@ namespace FieldAnalysis
 
             return (labels, centroids);
         }
-
+        //Centroidok inicializálása
         private static double[] InitializeCentroids(int[,] grid, int k)
         {
             int width = grid.GetLength(0), height = grid.GetLength(1);
@@ -189,7 +197,131 @@ namespace FieldAnalysis
             }
             return centroids;
         }
+        //Polygonok generálása
+        public static List<(int, List<int[]>)> GeneratePolygons(int[,] labels)
+        {
+            int width = labels.GetLength(0), height = labels.GetLength(1);
+            bool[,] visited = new bool[width, height];
+            List<(int, List<int[]>)> regions = new List<(int, List<int[]>)>();
 
+            for (int i = 0; i < width; i++)
+            {
+                for (int j = 0; j < height; j++)
+                {
+                    if (!visited[i, j])
+                    {
+                        int label = labels[i, j];
+                        List<int[]> region = new List<int[]>();
+                        Stack<int[]> stack = new Stack<int[]>();
+                        stack.Push(new int[] { i, j });
+
+                        while (stack.Count > 0)
+                        {
+                            int[] cell = stack.Pop();
+                            int x = cell[0], y = cell[1];
+                            if (x < 0 || x >= width || y < 0 || y >= height || visited[x, y] || labels[x, y] != label)
+                                continue;
+                            visited[x, y] = true;
+                            region.Add(new int[] { x, y });
+                            stack.Push(new int[] { x + 1, y });
+                            stack.Push(new int[] { x - 1, y });
+                            stack.Push(new int[] { x, y + 1 });
+                            stack.Push(new int[] { x, y - 1 });
+                        }
+
+                        // Területszűrés: 0.5 hektár = 5000 m² = 5000 cella (1 cella = 1x1 m)
+                        if (region.Count >= 5000)
+                            regions.Add((label, region));
+                    }
+                }
+            }
+            return regions;
+        }
+        //Multipolygonok létrehozása
+        public static async Task<List<Feature>> CreateMultiPolygons(List<(int, List<int[]>)> polygons, double[] centroids, string connectionString)
+        {
+            List<Feature> features = new List<Feature>();
+            GeometryFactory factory = new GeometryFactory();
+
+            //Raszter metaadatok lekérése a georeferenciáláshoz
+            double pixelSizeX = 1.0, pixelSizeY = 1.0, upperLeftX = 0.0, upperLeftY = 0.0;
+            using (var connection = new NpgsqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                string query = "SELECT ST_PixelWidth(geom) AS pixel_x, ST_PixelHeight(geom) AS pixel_y, " +
+                              "ST_UpperLeftX(geom) AS ul_x, ST_UpperLeftY(geom) AS ul_y " +
+                              "FROM grids WHERE name = 'Debreceni példa'";
+                using var command = new NpgsqlCommand(query, connection);
+                using var reader = await command.ExecuteReaderAsync();
+                if (reader.Read())
+                {
+                    pixelSizeX = reader.GetDouble(0);
+                    pixelSizeY = reader.GetDouble(1);
+                    upperLeftX = reader.GetDouble(2);
+                    upperLeftY = reader.GetDouble(3);
+                }
+                else
+                    throw new Exception("Nem található raszter metaadat.");
+            }
+
+            //Klaszterenként csoportosítás
+            var groupedPolygons = polygons.GroupBy(p => p.Item1).ToDictionary(g => g.Key, g => g.Select(p => p.Item2).ToList());
+
+            foreach (var clusterId in groupedPolygons.Keys)
+            {
+                List<Polygon> clusterPolygons = new List<Polygon>();
+                foreach (var cells in groupedPolygons[clusterId])
+                {
+                    //Cellákból négyszög polygonok készítése
+                    List<Coordinate> coordinates = new List<Coordinate>();
+                    foreach (var cell in cells)
+                    {
+                        // Bal felső és jobb alsó sarok koordinátái
+                        double x1 = upperLeftX + cell[1] * pixelSizeX;
+                        double y1 = upperLeftY - cell[0] * pixelSizeY;
+                        double x2 = x1 + pixelSizeX;
+                        double y2 = y1 - pixelSizeY;
+
+                        //Négyzet koordinátái
+                        coordinates.Clear();
+                        coordinates.Add(new Coordinate(x1, y1));
+                        coordinates.Add(new Coordinate(x2, y1));
+                        coordinates.Add(new Coordinate(x2, y2));
+                        coordinates.Add(new Coordinate(x1, y2));
+                        coordinates.Add(new Coordinate(x1, y1)); // Zárás
+
+                        var polygon = factory.CreatePolygon(coordinates.ToArray());
+                        clusterPolygons.Add(polygon);
+                    }
+                }
+
+                //Multipolygonok létrehozása
+                if (clusterPolygons.Count > 0)
+                {
+                    var multiPolygon = factory.CreateMultiPolygon(clusterPolygons.ToArray());
+                    var properties = new AttributesTable();
+                    properties.Add("cluster_id", clusterId);
+                    properties.Add("average_value", centroids[clusterId]);
+                    features.Add(new Feature(multiPolygon, properties));
+                }
+            }
+
+            return features;
+        }
+
+        //GeoJSON fájl mentése
+        public static void SaveGeoJson(List<Feature> features, string filename)
+        {
+            var featureCollection = new NetTopologySuite.Features.FeatureCollection();
+            foreach (var feature in features)
+                featureCollection.Add(feature);
+
+            var writer = new GeoJsonWriter();
+            string geoJson = writer.Write(featureCollection);
+            File.WriteAllText(filename, geoJson);
+            Console.WriteLine($"GeoJSON mentve: {filename}");
+        }
+        //Raszter kép mentése
         public static void SaveRasterImage(int[,] grid, string filename)
         {
             Bitmap bmp = new Bitmap(512, 512);
@@ -200,6 +332,7 @@ namespace FieldAnalysis
             Console.WriteLine($"Raszter kép mentve: {filename}");
         }
 
+        //Klaszter kép mentése
         public static void SaveClusterImage(int[,] labels, string filename)
         {
             Bitmap bmp = new Bitmap(512, 512);
