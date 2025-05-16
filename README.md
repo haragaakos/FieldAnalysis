@@ -1,3 +1,5 @@
+FieldAnalysis program működési leírás
+
 Ez a C# program egy térinformatikai (GIS) elemző alkalmazás, amely raszteres adatok feldolgozására és klaszterezésére szolgál, majd az eredményeket GeoJSON formátumban menti el. Az alábbiakban összefoglalom, mit csinál a program lépésről lépésre:
 
 Adatok kinyerése PostgreSQL adatbázisból (FetchData):
